@@ -1,6 +1,8 @@
 (ns clomian
   (:require clojure.java.io)
-  (:use [incanter core charts])
+  (:use [incanter core charts]
+        carrit.region-file
+        [clojure.tools.logging :only [info]])
   (:gen-class))
 
 ;(set! *warn-on-reflection* true)
@@ -98,48 +100,78 @@
             85 "Fence"
             89 "Lightstone"})
 
-(defn dat-seq [^java.io.File dir]
-  (filter #(let [n (.getName ^java.io.File %)]
-             (and
-               (.endsWith n ".dat")
-               (.startsWith n "c.")))
-    (tree-seq
-     (fn [^java.io.File f] (and
-                             (.isDirectory f)
-                             (let [n (.getName f)]
-                               (or (> 3 (count n))
-                                   (= n (.getName dir))))))
-     (fn [^java.io.File d] (seq (.listFiles d)))
-     dir)))
+(def graph-height-limit 128)
+
+(def chunks-per-section 16)
+(def blocks-per-chunk-x 16)
+(def blocks-per-chunk-y 16)
+(def blocks-per-chunk-z 16)
+(def blocks-per-chunk-layer (* blocks-per-chunk-x blocks-per-chunk-z))
+
+(def section-max 15)
 
 (defn aconcat [& ars]
   (let [offset (reductions + (map alength ars))
-        total-lenght (last offset)
-        far (java.util.Arrays/copyOf (first ars) total-lenght)]
+        total-length (last offset)
+        far (java.util.Arrays/copyOf (first ars) total-length)]
     (doseq [[ar off] (map vector (next ars) offset)]
       (System/arraycopy ar 0 far off (alength ar)))
     far))
 
-(defn blocks [^java.io.File file]
-  (with-open [nbt (-> file
-                    java.io.FileInputStream.
-                    java.io.BufferedInputStream.
-                    org.jnbt.NBTInputStream.)]
-    (-> nbt
-      .readTag
-      ^java.util.Map (.getValue)
-      ^org.jnbt.CompoundTag (.get "Level")
-      .getValue
-      ^org.jnbt.ByteArrayTag (.get "Blocks")
-      .getValue)))
+(defn block-nbts [region-file-map]
+  (let [files (vals region-file-map)
+        regions (doall (map read-region-file files))
+        first-region (first regions)]
+    (clojure.tools.logging/info (create-file-descriptor (.getName (first files))) (first files))
+    (clojure.tools.logging/info (:filename first-region) (:x first-region) (:z first-region))
+    (let [chunks (mapcat :chunks regions)
+          ;chunks (mapcat #(:chunks %) regions)
+          n (info (count chunks))
+          maybe-nil (map #(let [[[x z] chunk] %] (:nbt chunk)) chunks)
+          chunk-nbts (filter #(not (nil? %)) maybe-nil)
+          chunk-blocks (mapcat #(get-in % [:data "Level" :data "Sections" :data]) chunk-nbts)]
+      (assert (and (not (nil? chunks)) (not (empty? chunks))))
+      (assert (not (empty? chunk-nbts)))
+      (doseq [item chunk-nbts]
+        (assert (not (nil? item))))
+      (assert (not (empty? chunk-nbts)))
+      (assert (and (not (nil? chunk-blocks)) (not (empty? chunk-blocks))))
+      (doseq [item chunk-blocks] (assert (not (nil? item))))
+      chunk-blocks)))
 
-(defn get-layer [layer-num ^bytes blocks]
-  (let [size (/ ^Long (alength blocks) 128)
+(defn y-ordered-blocks [block-nbts]
+  (let [section-y-range (range 0 (inc section-max))
+        ordered-blocks (zipmap section-y-range (map (fn [_] []) section-y-range))]
+        (reduce (fn [ordered-result block-nbt]
+                  (let [y (get-in block-nbt ["Y" :data])
+                        blocks (get-in block-nbt ["Blocks" :data])]
+                    (assoc ordered-result y (conj (ordered-result y) block-nbt))))
+                ordered-blocks
+                block-nbts)))
+
+(defn coord-to-block-idx [x y z]
+  "Translates an x/y/z coordinate to a block index"
+  )
+
+(defn copy-block [block-array y output output-start-idx]
+  (loop [output-idx output-start-idx
+         x 0
+         z 0]
+    (if (= output-idx (+ output-start-idx blocks-per-chunk-layer))
+      output
+      (let [block-idx (+ x (* z blocks-per-chunk-x) (* y blocks-per-chunk-layer))]
+        (aset output output-idx (aget block-array block-idx))
+        (recur (inc output-idx) (inc x) (inc z))))))
+
+; TODO: Investigate performance improvement by checking frequencies over original arrays instead of copying
+(defn get-layer [y blocks]
+  (let [section-y (quot y chunks-per-section)
+        size (* (count (blocks y)) blocks-per-chunk-layer)
         output (byte-array size)]
-    (doseq [output-idx (range size)]
-      (let [block-idx (+ (* output-idx 128) layer-num)]
-        (aset output output-idx (aget blocks block-idx))))
-    output))
+    ; Go through each block array, copying it to output
+    (assert (= (count (blocks y)) (count (range 0 size blocks-per-chunk-layer))))
+    (doseq [[output-start-idx block-array] (map vector (range 0 size blocks-per-chunk-layer) (blocks y))]
+      (copy-block block-array y output output-start-idx))))
 
 (defn afrequencies
   [^bytes a]
@@ -148,8 +180,8 @@
             (let [x (aget a idx)]
               (assoc! counts x (inc (get counts x 0)))))))
 
-(defn freqs [^bytes blocks]
-  (let [layers (map #(get-layer % blocks) (range 128))]
+(defn freqs [blocks]
+  (let [layers (map #(get-layer % blocks) (range graph-height-limit))]
     (pmap afrequencies layers)))
 
 (defn plotfn [freqs btype layer]
@@ -157,9 +189,11 @@
 
 (defn -main [path & options]
   (let [options (set (map #(Integer. ^String %) options))
-        fr (time (apply aconcat (map blocks (dat-seq (clojure.java.io/file path)))))
+        fr (time (let [region-files (:region-files (save-dir-files path))
+                       block-nbts (block-nbts region-files)]
+                   (y-ordered-blocks block-nbts)))
         fr (time (freqs fr))        
-        canvas (time (-> (reduce #(add-function %1 (partial plotfn fr (key %2)) 0 128
+        canvas (time (-> (reduce #(add-function %1 (partial plotfn fr (key %2)) 0 graph-height-limit
                                           :series-label (val %2))
                            (xy-plot [] []
                                     :x-label "Layer"
